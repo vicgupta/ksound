@@ -135,6 +135,41 @@ func TestFormatElapsed(t *testing.T) {
 	}
 }
 
+func TestResampleLinear(t *testing.T) {
+	// same rate: unchanged
+	src := []float32{0.1, -0.2, 0.3}
+	if got := ResampleLinear(src, 16000, 16000); len(got) != 3 || got[0] != 0.1 {
+		t.Fatalf("identity resample = %v", got)
+	}
+	// constant signal stays constant through rate change
+	constant := make([]float32, 1600)
+	for i := range constant {
+		constant[i] = 0.5
+	}
+	down := ResampleLinear(constant, 16000, 8000)
+	if len(down) != 800 {
+		t.Fatalf("16000->8000 len = %d, want 800", len(down))
+	}
+	for i, v := range down {
+		if math.Abs(float64(v-0.5)) > 1e-6 {
+			t.Fatalf("down[%d] = %v, want 0.5", i, v)
+		}
+	}
+	up := ResampleLinear(constant, 8000, 16000)
+	if len(up) != 3200 {
+		t.Fatalf("8000->16000 len = %d, want 3200", len(up))
+	}
+	// ramp midpoint lands halfway
+	ramp := []float32{0, 1}
+	mid := ResampleLinear(ramp, 2, 4)
+	if len(mid) != 4 || math.Abs(float64(mid[1]-0.5)) > 1e-6 {
+		t.Fatalf("ramp resample = %v", mid)
+	}
+	if len(ResampleLinear(nil, 16000, 8000)) != 0 {
+		t.Fatal("nil resample should be empty")
+	}
+}
+
 func TestEnsureAudioPath(t *testing.T) {
 	p, err := EnsureAudioPath("", FormatFLAC)
 	if err != nil {

@@ -13,6 +13,10 @@ import (
 const (
 	modelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2"
 	modelDir = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+	// Silero VAD (~2MB) used to split long recordings into speech
+	// segments, since the Parakeet encoder cannot decode very long
+	// audio in one shot.
+	vadModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 )
 
 // ModelFiles holds resolved ONNX model paths.
@@ -69,6 +73,45 @@ func allExist(m ModelFiles) bool {
 		}
 	}
 	return true
+}
+
+// EnsureVadModel downloads the Silero VAD model on first use and returns
+// its path. Used to split long recordings into transcribable segments.
+func EnsureVadModel() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "ksound", "models")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "silero_vad.onnx")
+	if st, err := os.Stat(path); err == nil && !st.IsDir() && st.Size() > 0 {
+		return path, nil
+	}
+	fmt.Printf("Downloading Silero VAD model to %s ...\n", path)
+	resp, err := http.Get(vadModelURL) //nolint:gosec,noctx
+	if err != nil {
+		return "", fmt.Errorf("download VAD model: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download VAD model: HTTP %s", resp.Status)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return "", fmt.Errorf("download VAD model: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	fmt.Println("VAD model ready.")
+	return path, nil
 }
 
 func downloadAndExtract(url, destDir string) error {

@@ -497,6 +497,31 @@ func DecodeWAVFile(path string) ([]float32, int, error) {
 	return out, buf.Format.SampleRate, nil
 }
 
+// ResampleLinear resamples mono float32 audio by linear interpolation.
+// Returns src unchanged when rates match.
+func ResampleLinear(src []float32, fromRate, toRate int) []float32 {
+	if fromRate == toRate || len(src) == 0 {
+		return src
+	}
+	n := int(int64(len(src)) * int64(toRate) / int64(fromRate))
+	if n < 1 {
+		n = 1
+	}
+	out := make([]float32, n)
+	step := float64(fromRate) / float64(toRate)
+	for i := range out {
+		pos := float64(i) * step
+		lo := int(pos)
+		hi := lo + 1
+		if hi >= len(src) {
+			hi = len(src) - 1
+		}
+		frac := float32(pos - float64(lo))
+		out[i] = src[lo]*(1-frac) + src[hi]*frac
+	}
+	return out
+}
+
 // LoadAudioForTranscribe decodes .wav or .flac into mono float32 samples.
 func LoadAudioForTranscribe(path string) ([]float32, int, error) {
 	if InferAudioFormat(path) == FormatWAV {

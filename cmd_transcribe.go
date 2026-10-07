@@ -85,7 +85,12 @@ func transcribeFile(audioPath, txtOut string, threads int, m ModelFiles) (string
 		fmt.Println("(empty result — input may be silent or too short)")
 		return out, nil
 	}
-	printBoxed("Transcription", text)
+	fmt.Printf("Transcription:\n%s\n", text)
+	if err := copyToClipboard(text); err != nil {
+		fmt.Fprintf(os.Stderr, "Could not copy transcript to clipboard: %v\n", err)
+	} else {
+		fmt.Println("Transcript copied to clipboard.")
+	}
 	return out, nil
 }
 

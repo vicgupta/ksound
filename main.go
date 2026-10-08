@@ -19,6 +19,7 @@ Default (no subcommand): record until Enter, then transcribe.
   ksound -o note.txt
   ksound --format wav --device "MacBook" --keep-audio=false`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		defaultCombinedOptions.formatSet = cmd.Flags().Changed("format")
 		return runRecordAndTranscribe(defaultCombinedOptions)
 	},
 }
@@ -30,10 +31,16 @@ func init() {
 }
 
 func main() {
+	rootCmd.SilenceUsage = true
+	rootCmd.SilenceErrors = true
 	rootCmd.AddCommand(newRecordAndTranscribeCmd())
 	rootCmd.AddCommand(newRecordCmd())
 	rootCmd.AddCommand(newTranscribeCmd())
 	rootCmd.AddCommand(newDevicesCmd())
+	for _, c := range rootCmd.Commands() {
+		c.SilenceUsage = true
+		c.SilenceErrors = true
+	}
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

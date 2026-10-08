@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -48,23 +51,48 @@ func DefaultAudioFile(format string) (string, error) {
 	return filepath.Join("recordings", fmt.Sprintf("%s.%s", timestampNow(), format)), nil
 }
 
-// EnsureAudioPath resolves an explicit --audio-out/--output path: if empty a
-// timestamped default is used; if the path has no audio extension the format's
-// extension is appended; parent dirs are created.
-func EnsureAudioPath(out, format string) (string, error) {
+// EnsureAudioPath resolves the output path and effective audio format. An
+// explicit .flac/.wav extension wins over the default; if the user also passed
+// --format explicitly (formatSet) and it conflicts with the extension, that is
+// an error. Other extensions are rejected; a missing extension gets the
+// format's extension. Parent dirs are created.
+func EnsureAudioPath(out, format string, formatSet bool) (string, string, error) {
+	f, err := NormalizeAudioFormat(format)
+	if err != nil {
+		return "", "", err
+	}
 	if out == "" {
-		return DefaultAudioFile(format)
+		p, err := DefaultAudioFile(f)
+		return p, f, err
 	}
 	ext := strings.ToLower(filepath.Ext(out))
-	if ext != ".flac" && ext != ".wav" {
-		out += "." + format
-	}
-	if dir := filepath.Dir(out); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", err
+	switch ext {
+	case ".flac", ".wav":
+		eff := strings.TrimPrefix(ext, ".")
+		if formatSet && eff != f {
+			return "", "", fmt.Errorf("output extension %q conflicts with --format %s", ext, f)
 		}
+		if err := mkdirFor(out); err != nil {
+			return "", "", err
+		}
+		return out, eff, nil
+	case "":
+		if err := mkdirFor(out); err != nil {
+			return "", "", err
+		}
+		return out + "." + f, f, nil
+	default:
+		return "", "", fmt.Errorf("ksound records flac or wav only (got %q)", ext)
 	}
-	return out, nil
+}
+
+// mkdirFor creates the parent directory of path when it is not the cwd.
+func mkdirFor(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
+	}
+	return os.MkdirAll(dir, 0o755)
 }
 
 // InferAudioFormat returns flac/wav based on file extension.
@@ -101,10 +129,149 @@ func ListCaptureDevices() ([]string, error) {
 	return names, nil
 }
 
-// RecordUntilEnter captures mono 16-bit audio at 16kHz until Enter is pressed.
-// If deviceSubstr is non-empty, the first capture device whose name contains
-// it (case-insensitive) is used; otherwise the default device is used.
-func RecordUntilEnter(deviceSubstr string) ([]int16, error) {
+// stopReason identifies why recording stopped.
+type stopReason int
+
+const (
+	stopEnter stopReason = iota
+	stopSignal
+	stopDuration
+	stopPartialError
+)
+
+// waitForStop blocks until one of the injected events fires and reports why.
+// A nil channel blocks forever, so callers can leave duration disabled by
+// passing a nil timeout.
+func waitForStop(enter <-chan struct{}, sig <-chan os.Signal, timeout <-chan time.Time) stopReason {
+	reason, _ := waitForStopWithErrors(enter, sig, timeout, nil)
+	return reason
+}
+
+func waitForStopWithErrors(enter <-chan struct{}, sig <-chan os.Signal, timeout <-chan time.Time, partialErr <-chan error) (stopReason, error) {
+	select {
+	case <-enter:
+		return stopEnter, nil
+	case <-sig:
+		return stopSignal, nil
+	case <-timeout:
+		return stopDuration, nil
+	case err := <-partialErr:
+		return stopPartialError, err
+	}
+}
+
+// readEnter signals ch when a line is entered on stdin. EOF (for example when
+// stdin is /dev/null or a closed pipe) is deliberately ignored so a
+// non-interactive run is never stopped by an empty stdin.
+func readEnter(ch chan<- struct{}) {
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err == nil {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// stdinIsTerminal reports whether stdin is attached to a terminal.
+func stdinIsTerminal() bool {
+	return isTerminal(os.Stdin)
+}
+
+// writeFullAt writes all bytes at offset, retrying legal short writes.
+func writeFullAt(w io.WriterAt, data []byte, offset int64) error {
+	for len(data) > 0 {
+		n, err := w.WriteAt(data, offset)
+		if n > 0 {
+			data = data[n:]
+			offset += int64(n)
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+// writePartialLoopWithErrors appends newly captured PCM bytes to path roughly
+// once a second until stop is closed, then flushes the remainder. It never
+// runs on the audio callback thread and reports disk errors through errCh.
+func writePartialLoopWithErrors(mu *sync.Mutex, raw *[]byte, path string, stop <-chan struct{}, errCh chan<- error) {
+	reportError := func(err error) {
+		if errCh == nil {
+			return
+		}
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var f *os.File
+	flushed := 0
+	flush := func() error {
+		mu.Lock()
+		end := len(*raw)
+		if end <= flushed {
+			mu.Unlock()
+			return nil
+		}
+		chunk := append([]byte(nil), (*raw)[flushed:end]...)
+		start := flushed
+		mu.Unlock()
+
+		if f == nil {
+			var err error
+			f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+		}
+		if err := writeFullAt(f, chunk, int64(start)); err != nil {
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		flushed = end
+		return nil
+	}
+	defer func() {
+		if f != nil {
+			if err := f.Close(); err != nil {
+				reportError(err)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-stop:
+			if err := flush(); err != nil {
+				reportError(err)
+			}
+			return
+		case <-ticker.C:
+			if err := flush(); err != nil {
+				reportError(err)
+				return
+			}
+		}
+	}
+}
+
+// RecordUntilStop captures mono 16-bit audio at 16kHz. It stops on the first
+// of: Enter on stdin, SIGINT/SIGTERM, or maxDur elapsing (when > 0). If
+// partialPath is non-empty, captured audio is appended there periodically so
+// a crash never loses the whole recording; the caller deletes it after a clean
+// save. If deviceSubstr is non-empty, the first capture device whose name
+// contains it (case-insensitive) is used; otherwise the default device is used.
+func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath string) ([]int16, error) {
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("init audio context: %w", err)
@@ -165,13 +332,57 @@ func RecordUntilEnter(deviceSubstr string) ([]int16, error) {
 	}
 	defer device.Stop()
 
-	fmt.Println("Recording... press Enter to stop.")
-	stopMeter := startLevelMeter(&mu, &raw, time.Now())
-	if _, err := fmt.Scanln(); err != nil {
-		// Scanln returns error on empty line in some cases; treat as stop.
-		fmt.Fprintln(os.Stderr, "")
+	var partialWG sync.WaitGroup
+	stopPartial := make(chan struct{})
+	var partialErrors <-chan error
+	if partialPath != "" {
+		errCh := make(chan error, 1)
+		partialErrors = errCh
+		partialWG.Add(1)
+		go func() {
+			defer partialWG.Done()
+			writePartialLoopWithErrors(&mu, &raw, partialPath, stopPartial, errCh)
+		}()
 	}
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	enterCh := make(chan struct{}, 1)
+	go readEnter(enterCh)
+	if !stdinIsTerminal() {
+		fmt.Fprintln(os.Stderr, "stdin is not a terminal; press Ctrl+C or pass --duration to stop")
+	}
+
+	var timeoutCh <-chan time.Time
+	if maxDur > 0 {
+		timer := time.NewTimer(maxDur)
+		defer timer.Stop()
+		timeoutCh = timer.C
+		fmt.Printf("Recording... press Enter or Ctrl+C to stop early (max %s).\n", maxDur)
+	} else {
+		fmt.Println("Recording... press Enter to stop.")
+	}
+
+	stopMeter := startLevelMeter(&mu, &raw, time.Now())
+	reason, partialErr := waitForStopWithErrors(enterCh, sigCh, timeoutCh, partialErrors)
 	stopMeter()
+
+	if reason == stopSignal {
+		// Restore default handling so a second Ctrl+C kills the process.
+		signal.Reset(os.Interrupt, syscall.SIGTERM)
+		fmt.Fprintln(os.Stderr, "\nInterrupted — saving recording...")
+	}
+
+	close(stopPartial)
+	partialWG.Wait()
+	if partialErr == nil && partialErrors != nil {
+		select {
+		case partialErr = <-partialErrors:
+		default:
+		}
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -181,7 +392,45 @@ func RecordUntilEnter(deviceSubstr string) ([]int16, error) {
 	for i := 0; i < n; i++ {
 		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
 	}
-	return samples, nil
+	return samples, partialErr
+}
+
+// RecoverPartialRecordings converts leftover *.partial.pcm crash files in dir
+// into <name>.recovered.flac (16kHz mono s16le), removes the .pcm files, and
+// returns the recovered FLAC paths.
+func RecoverPartialRecordings(dir string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.partial.pcm"))
+	if err != nil {
+		return nil, err
+	}
+	var recovered []string
+	for _, m := range matches {
+		raw, err := os.ReadFile(m)
+		if err != nil {
+			return recovered, err
+		}
+		if len(raw) < 2 {
+			_ = os.Remove(m)
+			continue
+		}
+		n := len(raw) / 2
+		samples := make([]int16, n)
+		for i := 0; i < n; i++ {
+			samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
+		}
+		base := strings.TrimSuffix(m, ".partial.pcm")
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+		out := base + ".recovered.flac"
+		if err := SaveFLAC(out, samples); err != nil {
+			return recovered, err
+		}
+		if err := os.Remove(m); err != nil {
+			return recovered, err
+		}
+		recovered = append(recovered, out)
+		fmt.Printf("Recovered unsaved recording: %s\n", out)
+	}
+	return recovered, nil
 }
 
 // dbFS converts a linear int16 peak to dBFS (0 dB = full scale).

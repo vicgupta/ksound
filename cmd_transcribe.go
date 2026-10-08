@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 	"github.com/spf13/cobra"
@@ -20,12 +21,69 @@ func resolveModel(encoder, decoder, joiner, tokens string) (ModelFiles, error) {
 	return EnsureModel()
 }
 
+// modelLoadError builds a clear message for a failed sherpa initialisation,
+// pointing at the cache directory the user can delete to force a re-download.
+func modelLoadError(what string) error {
+	if dir, err := ModelCacheDir(); err == nil {
+		return fmt.Errorf("failed to %s (corrupt cache?); delete %s and retry", what, dir)
+	}
+	return fmt.Errorf("failed to %s (corrupt cache?)", what)
+}
+
 // maxSingleShotSeconds caps single-shot decoding: the Parakeet encoder
 // crashes (ONNX broadcast error) on very long inputs, so longer audio is
 // split into speech segments with Silero VAD and decoded piece by piece.
 const maxSingleShotSeconds = 300
 
-func transcribeFile(audioPath, txtOut string, threads int, m ModelFiles) (string, error) {
+func normalizeTranscriptFormat(format string) (string, error) {
+	if format == "" {
+		return "text", nil
+	}
+	switch format {
+	case "text", "markdown":
+		return format, nil
+	default:
+		return "", fmt.Errorf("unsupported transcript format %q (choose text or markdown)", format)
+	}
+}
+
+func defaultTranscriptPath(audioPath, format string) string {
+	ext := ".txt"
+	if format == "markdown" {
+		ext = ".md"
+	}
+	return strings.TrimSuffix(audioPath, filepath.Ext(audioPath)) + ext
+}
+
+func transcriptOutputPath(audioPath, explicitPath, format string) string {
+	if explicitPath != "" {
+		return explicitPath
+	}
+	return defaultTranscriptPath(audioPath, format)
+}
+
+func formatTranscript(audioPath, transcript, format string, createdAt time.Time) (string, error) {
+	format, err := normalizeTranscriptFormat(format)
+	if err != nil {
+		return "", err
+	}
+	if format == "text" {
+		return transcript + "\n", nil
+	}
+
+	name := filepath.Base(audioPath)
+	title := strings.TrimSuffix(name, filepath.Ext(name))
+	source := strings.ReplaceAll(name, "`", "\\`")
+	return fmt.Sprintf("# %s\n\nSource: `%s`\nTranscribed: %s\n\n%s\n",
+		title, source, createdAt.Format("2006-01-02 15:04 MST"), transcript), nil
+}
+
+func transcribeFile(audioPath, txtOut, outputFormat string, threads int, m ModelFiles) (string, error) {
+	var err error
+	outputFormat, err = normalizeTranscriptFormat(outputFormat)
+	if err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(audioPath); err != nil {
 		return "", fmt.Errorf("input file: %w", err)
 	}
@@ -51,6 +109,9 @@ func transcribeFile(audioPath, txtOut string, threads int, m ModelFiles) (string
 
 	fmt.Println("Loading model (first run takes a while)...")
 	recognizer := sherpa.NewOfflineRecognizer(&config)
+	if recognizer == nil {
+		return "", modelLoadError("load the speech model")
+	}
 	defer sherpa.DeleteOfflineRecognizer(recognizer)
 
 	duration := float64(len(samples)) / float64(sampleRate)
@@ -72,12 +133,13 @@ func transcribeFile(audioPath, txtOut string, threads int, m ModelFiles) (string
 		text = strings.TrimSpace(result.Text)
 	}
 
-	out := txtOut
-	if out == "" {
-		ext := filepath.Ext(audioPath)
-		out = strings.TrimSuffix(audioPath, ext) + ".txt"
+	createdAt := time.Now()
+	formatted, err := formatTranscript(audioPath, text, outputFormat, createdAt)
+	if err != nil {
+		return "", err
 	}
-	if err := os.WriteFile(out, []byte(text+"\n"), 0o644); err != nil {
+	out := transcriptOutputPath(audioPath, txtOut, outputFormat)
+	if err := os.WriteFile(out, []byte(formatted), 0o644); err != nil {
 		return "", err
 	}
 	fmt.Printf("Transcription written to %s\n", out)
@@ -127,7 +189,7 @@ func transcribeLong(recognizer *sherpa.OfflineRecognizer, samples []float32, sam
 	}
 	vad := sherpa.NewVoiceActivityDetector(&vadConfig, 100)
 	if vad == nil {
-		return "", fmt.Errorf("failed to create VAD (model: %s)", vadPath)
+		return "", modelLoadError(fmt.Sprintf("create the VAD (model: %s)", vadPath))
 	}
 	defer sherpa.DeleteVoiceActivityDetector(vad)
 
@@ -203,23 +265,25 @@ func firstWords(s string, n int) string {
 
 func newTranscribeCmd() *cobra.Command {
 	var output string
+	var outputFormat string
 	var threads int
 	var encoder, decoder, joiner, tokens string
 
 	cmd := &cobra.Command{
 		Use:   "transcribe <file.flac|file.wav>",
-		Short: "Transcribe a FLAC/WAV file locally, write plain-text .txt",
+		Short: "Transcribe a FLAC/WAV file locally",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			m, err := resolveModel(encoder, decoder, joiner, tokens)
 			if err != nil {
 				return err
 			}
-			_, err = transcribeFile(args[0], output, threads, m)
+			_, err = transcribeFile(args[0], output, outputFormat, threads, m)
 			return err
 		},
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output text path (default: <input>.txt)")
+	cmd.Flags().StringVar(&outputFormat, "transcript-format", "text", "transcript format: text or markdown")
 	cmd.Flags().IntVar(&threads, "threads", 2, "ONNX threads")
 	cmd.Flags().StringVar(&encoder, "encoder", "", "override: path to encoder.int8.onnx")
 	cmd.Flags().StringVar(&decoder, "decoder", "", "override: path to decoder.int8.onnx")

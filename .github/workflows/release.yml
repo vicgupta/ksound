@@ -39,7 +39,7 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$so"
           done
           "$OUT/ksound" --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ksound_linux_amd64
           path: dist/ksound_linux_amd64
@@ -75,11 +75,11 @@ jobs:
               "$OUT/ksound" --version
             fi
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ksound_darwin_arm64
           path: dist/ksound_darwin_arm64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ksound_darwin_amd64
           path: dist/ksound_darwin_amd64
@@ -116,7 +116,7 @@ jobs:
             if [ -f "$p" ]; then cp "$p" "$OUT/"; fi
           done
           "$OUT/ksound.exe" --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ksound_windows_amd64
           path: dist/ksound_windows_amd64

@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -175,7 +177,8 @@ func TestResampleLinear(t *testing.T) {
 }
 
 func TestEnsureAudioPath(t *testing.T) {
-	p, f, err := EnsureAudioPath("", FormatFLAC, false)
+	// Pure resolution creates no directories.
+	p, f, err := ResolveAudioPath("", FormatFLAC, false)
 	if err != nil {
 		t.Fatalf("default: %v", err)
 	}
@@ -183,18 +186,21 @@ func TestEnsureAudioPath(t *testing.T) {
 		t.Fatalf("default = %q (%s)", p, f)
 	}
 
-	p, f, err = EnsureAudioPath("out/note", FormatWAV, false)
+	p, f, err = ResolveAudioPath("out/note", FormatWAV, false)
 	if err != nil {
 		t.Fatalf("ext append: %v", err)
 	}
 	if filepath.Ext(p) != ".wav" || f != FormatWAV {
 		t.Fatalf("appended = %q (%s)", p, f)
 	}
+	if _, err := os.Stat("out"); !os.IsNotExist(err) {
+		t.Fatalf("ResolveAudioPath must not create directories, stat(out) err=%v", err)
+	}
 
 	// An explicit extension wins over the default format.
 	dir := t.TempDir()
 	wavPath := filepath.Join(dir, "x.wav")
-	p, f, err = EnsureAudioPath(wavPath, FormatFLAC, false)
+	p, f, err = ResolveAudioPath(wavPath, FormatFLAC, false)
 	if err != nil {
 		t.Fatalf("ext wins: %v", err)
 	}
@@ -213,13 +219,28 @@ func TestEnsureAudioPath(t *testing.T) {
 	}
 
 	// An explicit --format that conflicts with the extension is an error.
-	if _, _, err := EnsureAudioPath(wavPath, FormatFLAC, true); err == nil {
+	if _, _, err := ResolveAudioPath(wavPath, FormatFLAC, true); err == nil {
 		t.Fatal("expected format/extension conflict error")
 	}
 
 	// A non-audio extension is rejected.
-	if _, _, err := EnsureAudioPath(filepath.Join(dir, "x.mp3"), FormatFLAC, false); err == nil {
+	if _, _, err := ResolveAudioPath(filepath.Join(dir, "x.mp3"), FormatFLAC, false); err == nil {
 		t.Fatal("expected unsupported extension error")
+	}
+}
+
+func TestEnsureAudioPathCreatesDirs(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "sub", "note")
+	p, f, err := EnsureAudioPath(target, FormatWAV, false)
+	if err != nil {
+		t.Fatalf("EnsureAudioPath: %v", err)
+	}
+	if f != FormatWAV || filepath.Ext(p) != ".wav" {
+		t.Fatalf("got %q (%s)", p, f)
+	}
+	if st, err := os.Stat(filepath.Join(dir, "sub")); err != nil || !st.IsDir() {
+		t.Fatalf("parent dir was not created: %v", err)
 	}
 }
 
@@ -295,8 +316,8 @@ func TestWaitForStopReasons(t *testing.T) {
 	errCh := make(chan error, 1)
 	errCh <- io.ErrShortWrite
 	reason, gotErr := waitForStopWithErrors(make(chan struct{}), make(chan os.Signal), nil, errCh)
-	if reason != stopPartialError || gotErr != io.ErrShortWrite {
-		t.Fatalf("partial error -> (%v, %v), want (%v, %v)", reason, gotErr, stopPartialError, io.ErrShortWrite)
+	if reason != stopCaptureError || gotErr != io.ErrShortWrite {
+		t.Fatalf("partial error -> (%v, %v), want (%v, %v)", reason, gotErr, stopCaptureError, io.ErrShortWrite)
 	}
 }
 
@@ -362,5 +383,125 @@ func TestWritePartialLoopReportsOpenError(t *testing.T) {
 		}
 	default:
 		t.Fatal("partial writer error was not reported")
+	}
+}
+
+func TestMonitorCaptureStallFiresWhenDataStops(t *testing.T) {
+	var mu sync.Mutex
+	raw := make([]byte, 0)
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	out := make(chan error, 1)
+	defer close(done)
+	go monitorCaptureStall(&mu, &raw, &stopped, 40*time.Millisecond, 10*time.Millisecond, 5*time.Millisecond, done, out)
+
+	// Keep the data flowing past the stall threshold: no error yet.
+	feedUntil := time.Now().Add(80 * time.Millisecond)
+	for time.Now().Before(feedUntil) {
+		mu.Lock()
+		raw = append(raw, 1, 2)
+		mu.Unlock()
+		select {
+		case err := <-out:
+			t.Fatalf("stall reported while data was flowing: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	// Stop feeding: the stall must be reported.
+	select {
+	case err := <-out:
+		if !errors.Is(err, errCaptureStalled) {
+			t.Fatalf("err = %v, want errCaptureStalled", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("expected stall error, got none")
+	}
+}
+
+func TestMonitorCaptureStallGraceAfterDeviceStop(t *testing.T) {
+	var mu sync.Mutex
+	raw := make([]byte, 0)
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	out := make(chan error, 1)
+	defer close(done)
+	// Long stall threshold; the device-stopped flag must shorten it to grace.
+	go monitorCaptureStall(&mu, &raw, &stopped, time.Hour, 30*time.Millisecond, 5*time.Millisecond, done, out)
+	stopped.Store(true)
+	select {
+	case err := <-out:
+		if !errors.Is(err, errCaptureStalled) {
+			t.Fatalf("err = %v, want errCaptureStalled", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected stall error after device stop, got none")
+	}
+}
+
+func TestMonitorCaptureStallExitsOnDone(t *testing.T) {
+	var mu sync.Mutex
+	raw := make([]byte, 0)
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	out := make(chan error, 1)
+	close(done)
+	monitorCaptureStall(&mu, &raw, &stopped, time.Millisecond, time.Millisecond, time.Millisecond, done, out)
+	select {
+	case err := <-out:
+		t.Fatalf("unexpected error after done: %v", err)
+	default:
+	}
+}
+
+func TestEvaluateRecordingSpace(t *testing.T) {
+	// Fixed duration: needs PCM + FLAC/WAV output + slack.
+	needWAV := recordingSpaceNeed(60*time.Second, FormatWAV)
+	needFLAC := recordingSpaceNeed(60*time.Second, FormatFLAC)
+	if needWAV <= 2*60*targetSampleRate*2 {
+		t.Fatalf("wav need %d too small", needWAV)
+	}
+	if needFLAC >= needWAV {
+		t.Fatalf("flac need %d should be below wav need %d", needFLAC, needWAV)
+	}
+	if warn, err := evaluateRecordingSpace(needFLAC, 60*time.Second, FormatFLAC); err != nil || warn != "" {
+		t.Fatalf("exact fit -> (%q, %v), want no warn/error", warn, err)
+	}
+	if _, err := evaluateRecordingSpace(needFLAC-1, 60*time.Second, FormatFLAC); err == nil {
+		t.Fatal("want not-enough-space error")
+	}
+	// Open-ended recording: warn below the in-memory cap, silent above.
+	if warn, err := evaluateRecordingSpace(maxRecordingBytes-1, 0, FormatFLAC); err != nil || warn == "" {
+		t.Fatalf("low space -> (%q, %v), want warning", warn, err)
+	}
+	if warn, err := evaluateRecordingSpace(maxRecordingBytes, 0, FormatFLAC); err != nil || warn != "" {
+		t.Fatalf("plenty -> (%q, %v), want silent", warn, err)
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	cases := map[int64]string{
+		0:                 "0 B",
+		512:               "512 B",
+		1024:              "1.0 KB",
+		1536:              "1.5 KB",
+		1 << 20:           "1.0 MB",
+		3 << 30:           "3.0 GB",
+		(1 << 30) * 5 / 2: "2.5 GB",
+	}
+	for n, want := range cases {
+		if got := humanBytes(n); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestFreeDiskBytesProbe(t *testing.T) {
+	free, err := freeDiskBytes(t.TempDir())
+	if err != nil {
+		t.Fatalf("freeDiskBytes: %v", err)
+	}
+	if free <= 0 {
+		t.Fatalf("free = %d, want > 0", free)
 	}
 }

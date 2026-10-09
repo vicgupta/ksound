@@ -3,6 +3,8 @@ package main
 import (
 	"archive/tar"
 	"compress/bzip2"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,12 +29,23 @@ const (
 	// validated. A directory without it is treated as an incomplete cache.
 	completeMarker = ".complete"
 
+	// modelArchiveName is the release tarball cached next to the model dir
+	// so a failed/interrupted download can resume instead of restarting.
+	modelArchiveName = modelDir + ".tar.bz2"
+
 	// Minimum plausible file sizes, used to detect truncated downloads.
 	minEncoderBytes = int64(500 * 1024 * 1024)
 	minDecoderBytes = int64(1 * 1024 * 1024)
 	minJoinerBytes  = int64(1 * 1024 * 1024)
 	minTokensBytes  = int64(1 * 1024)
 	minVadBytes     = int64(1 * 1024 * 1024)
+
+	// staleTempDirMaxAge bounds PID-reuse risk: a tmp dir older than this is
+	// removed even if its PID appears live.
+	staleTempDirMaxAge = 24 * time.Hour
+
+	// downloadMaxAttempts caps transient-error retries for model fetches.
+	downloadMaxAttempts = 3
 )
 
 // ModelFiles holds resolved ONNX model paths.
@@ -139,7 +152,7 @@ func EnsureModel() (ModelFiles, error) {
 		return m, nil
 	}
 	if _, statErr := os.Stat(dir); statErr == nil {
-		fmt.Fprintln(os.Stderr, "Model cache incomplete, re-downloading...")
+		infof("Model cache incomplete, re-downloading...")
 		if err := os.RemoveAll(dir); err != nil {
 			return ModelFiles{}, err
 		}
@@ -152,25 +165,40 @@ func EnsureModel() (ModelFiles, error) {
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return ModelFiles{}, err
 	}
-	fmt.Printf("Downloading Parakeet model (~630MB) to %s ...\n", dir)
-	if err := downloadAndExtract(modelURL, tmpDir); err != nil {
+	archive := filepath.Join(filepath.Dir(dir), modelArchiveName)
+	infof("Downloading Parakeet model (~630MB, resumable)...")
+	if err := ensureModelArchive(modelURL, archive); err != nil {
+		return ModelFiles{}, err
+	}
+	infof("Extracting model archive...")
+	if err := extractModelArchive(archive, tmpDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
+		// Keep the verified archive so a retry skips the download.
 		return ModelFiles{}, err
 	}
 	if err := prepareModelTempDir(tmpDir, parakeetMinSizes()); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return ModelFiles{}, fmt.Errorf("model download incomplete: %w", err)
 	}
+	if err := verifyModelChecksums(tmpDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return ModelFiles{}, err
+	}
 	if err := os.Rename(tmpDir, dir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return ModelFiles{}, err
 	}
-	fmt.Println("Model ready.")
+	// Cache is complete; free the archive. The .sha256 sidecar stays behind
+	// as the integrity pin for any future re-download.
+	_ = os.Remove(archive)
+	infof("Model ready.")
 	return m, nil
 }
 
 // removeStaleTempDirs deletes leftover <dir>.tmp-* directories from a previous
 // interrupted download without removing a directory owned by a live process.
+// Directories older than staleTempDirMaxAge are removed regardless, since PIDs
+// can be recycled by the OS.
 func removeStaleTempDirs(dir string) {
 	parent := filepath.Dir(dir)
 	prefix := filepath.Base(dir) + ".tmp-"
@@ -182,12 +210,101 @@ func removeStaleTempDirs(dir string) {
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
+		full := filepath.Join(parent, e.Name())
 		pid, err := strconv.Atoi(strings.TrimPrefix(e.Name(), prefix))
 		if err == nil && pid > 0 && processIsRunning(pid) {
+			if st, statErr := os.Stat(full); statErr == nil {
+				if time.Since(st.ModTime()) < staleTempDirMaxAge {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+		_ = os.RemoveAll(full)
+	}
+}
+
+// withRetry runs fn up to attempts times with linear backoff for transient
+// network failures.
+func withRetry(attempts int, fn func() error) error {
+	var err error
+	for i := 1; i <= attempts; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if i < attempts {
+			infof("download attempt %d/%d failed: %v; retrying...", i, attempts, err)
+			time.Sleep(time.Duration(i) * 200 * time.Millisecond)
+		}
+	}
+	return err
+}
+
+// verifyModelChecksums optionally verifies extracted model files against
+// hex-encoded SHA256 hashes from the environment:
+// KSOUND_ENCODER_SHA256, KSOUND_DECODER_SHA256, KSOUND_JOINER_SHA256,
+// KSOUND_TOKENS_SHA256. Unset variables are skipped.
+func verifyModelChecksums(dir string) error {
+	envFor := map[string]string{
+		"encoder.int8.onnx": "KSOUND_ENCODER_SHA256",
+		"decoder.int8.onnx": "KSOUND_DECODER_SHA256",
+		"joiner.int8.onnx":  "KSOUND_JOINER_SHA256",
+		"tokens.txt":        "KSOUND_TOKENS_SHA256",
+	}
+	for name, env := range envFor {
+		want := strings.TrimSpace(os.Getenv(env))
+		if want == "" {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(parent, e.Name()))
+		if err := verifyFileSHA256(filepath.Join(dir, name), want); err != nil {
+			return fmt.Errorf("%s checksum: %w", name, err)
+		}
 	}
+	return nil
+}
+
+// fileSHA256 returns the hex SHA256 of the file at path.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// verifyFileSHA256 checks path against a hex-encoded SHA256.
+func verifyFileSHA256(path, wantHex string) error {
+	want := strings.TrimSpace(wantHex)
+	if b, err := hex.DecodeString(want); err != nil || len(b) != sha256.Size {
+		return fmt.Errorf("invalid SHA256 %q", wantHex)
+	}
+	got, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("mismatch (got %s)", got)
+	}
+	return nil
+}
+
+// resolveModelSHA256 returns the expected archive hash: the explicit
+// KSOUND_MODEL_SHA256 pin if set, otherwise the trust-on-first-use sidecar
+// written after a previous verified download.
+func resolveModelSHA256(archive string) string {
+	if h := strings.TrimSpace(os.Getenv("KSOUND_MODEL_SHA256")); h != "" {
+		return h
+	}
+	if b, err := os.ReadFile(archive + ".sha256"); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
 }
 
 // EnsureVadModel downloads the Silero VAD model on first use and returns
@@ -209,6 +326,11 @@ func ensureVadModel(dir, url string) (string, error) {
 	path := filepath.Join(dir, "silero_vad.onnx")
 	if st, err := os.Stat(path); err == nil {
 		if !st.IsDir() && st.Size() > minVadBytes {
+			if want := strings.TrimSpace(os.Getenv("KSOUND_VAD_SHA256")); want != "" {
+				if err := verifyFileSHA256(path, want); err != nil {
+					return "", fmt.Errorf("existing VAD model checksum: %w", err)
+				}
+			}
 			return path, nil
 		}
 		if err := os.Remove(path); err != nil {
@@ -219,8 +341,8 @@ func ensureVadModel(dir, url string) (string, error) {
 	}
 	tmp := path + ".tmp"
 	_ = os.Remove(tmp)
-	fmt.Printf("Downloading Silero VAD model to %s ...\n", path)
-	if err := downloadFile(url, tmp); err != nil {
+	infof("Downloading Silero VAD model to %s ...", path)
+	if err := withRetry(downloadMaxAttempts, func() error { return downloadFile(url, tmp) }); err != nil {
 		_ = os.Remove(tmp)
 		return "", err
 	}
@@ -229,11 +351,17 @@ func ensureVadModel(dir, url string) (string, error) {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("VAD model download incomplete in %s", dir)
 	}
+	if want := strings.TrimSpace(os.Getenv("KSOUND_VAD_SHA256")); want != "" {
+		if err := verifyFileSHA256(tmp, want); err != nil {
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("VAD model checksum: %w", err)
+		}
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return "", err
 	}
-	fmt.Println("VAD model ready.")
+	infof("VAD model ready.")
 	return path, nil
 }
 
@@ -258,6 +386,7 @@ func newDownloadClient() *http.Client {
 type progressReader struct {
 	r       io.Reader
 	total   int64
+	base    int64 // bytes already on disk before this transfer
 	read    int64
 	lastPct int
 }
@@ -266,7 +395,7 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
 	p.read += int64(n)
 	if p.total > 0 {
-		if pct := int(p.read * 100 / p.total); pct >= p.lastPct+5 {
+		if pct := int((p.base + p.read) * 100 / p.total); pct >= p.lastPct+5 {
 			p.lastPct = pct
 			fmt.Fprintf(os.Stderr, "  downloading... %d%%\n", pct)
 		}
@@ -274,28 +403,156 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func downloadAndExtract(url, destDir string) error {
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return err
+// errRangeRejected reports that the server refused our resume range; the
+// caller should discard the partial file and start over.
+var errRangeRejected = errors.New("server rejected resume range")
+
+// resumeDownload fetches url into dest, appending to a partial file when the
+// server honours HTTP Range. It errors when the result is shorter than the
+// advertised length, so a truncated transfer is never mistaken for a complete
+// archive.
+func resumeDownload(url, dest string) error {
+	var offset int64
+	if st, err := os.Stat(dest); err == nil && !st.IsDir() {
+		offset = st.Size()
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("download model: %w", err)
+	}
+	if offset > 0 {
+		req.Header.Set("Range", "bytes="+strconv.FormatInt(offset, 10)+"-")
 	}
 	resp, err := newDownloadClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("download model: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+
+	appendMode := false
+	var want int64 // expected total size afterwards; <=0 means unknown
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		appendMode = true
+		want = offset + resp.ContentLength
+	case http.StatusOK:
+		// Server ignored Range (or we asked from 0): full body, restart.
+		offset = 0
+		want = resp.ContentLength
+	case http.StatusRequestedRangeNotSatisfiable:
+		return errRangeRejected
+	default:
 		return fmt.Errorf("download model: HTTP %s", resp.Status)
 	}
 
-	var body io.Reader = resp.Body
-	if resp.ContentLength > 0 {
-		body = &progressReader{r: resp.Body, total: resp.ContentLength}
+	flags := os.O_CREATE | os.O_WRONLY
+	if appendMode {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
 	}
-	tr := tar.NewReader(bzip2.NewReader(body))
+	f, err := os.OpenFile(dest, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	pr := &progressReader{r: resp.Body, total: want, base: offset}
+	if _, err := io.Copy(f, pr); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("download model: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if want > 0 {
+		st, err := os.Stat(dest)
+		if err != nil {
+			return err
+		}
+		if st.Size() < want {
+			return fmt.Errorf("download model: truncated (%d of %d bytes)", st.Size(), want)
+		}
+	}
+	return nil
+}
+
+// ensureModelArchive downloads the model tarball to archive with resume
+// support. The archive is verified against KSOUND_MODEL_SHA256 when set,
+// otherwise against a trust-on-first-use .sha256 sidecar recorded after a
+// previous complete download. On mismatch the archive is discarded and the
+// download is retried from scratch.
+func ensureModelArchive(url, archive string) error {
+	// Fast path: a fully verified archive needs no HTTP at all.
+	if st, err := os.Stat(archive); err == nil && !st.IsDir() && st.Size() > 0 {
+		if expected := resolveModelSHA256(archive); expected != "" {
+			if verifyFileSHA256(archive, expected) == nil {
+				return nil
+			}
+			infof("Cached model archive failed checksum, re-downloading...")
+			if err := os.Remove(archive); err != nil {
+				return err
+			}
+		}
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= downloadMaxAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+		if err := resumeDownload(url, archive); err != nil {
+			if errors.Is(err, errRangeRejected) {
+				// Cannot confirm the existing copy; start clean.
+				_ = os.Remove(archive)
+				err = fmt.Errorf("resume rejected, restarting download")
+			}
+			lastErr = err
+			infof("download attempt %d/%d failed: %v; retrying...", attempt, downloadMaxAttempts, err)
+			continue
+		}
+		got, err := fileSHA256(archive)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if expected := resolveModelSHA256(archive); expected != "" {
+			if !strings.EqualFold(expected, got) {
+				_ = os.Remove(archive)
+				lastErr = fmt.Errorf("model archive checksum mismatch (got %s)", got)
+				infof("download attempt %d/%d failed: %v; retrying...", attempt, downloadMaxAttempts, lastErr)
+				continue
+			}
+			return nil
+		}
+		// Trust on first use: record the hash of this verified-complete
+		// archive so future re-downloads are pinned.
+		if err := os.WriteFile(archive+".sha256", []byte(got+"\n"), 0o644); err != nil {
+			infof("warning: could not record model checksum: %v", err)
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// extractModelArchive unpacks the verified bzip2 tar archive into destDir,
+// keeping only the model files ksound needs.
+func extractModelArchive(archivePath, destDir string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return fmt.Errorf("open model archive: %w", err)
+	}
+	defer f.Close()
+	return extractTar(bzip2.NewReader(f), destDir)
+}
+
+// extractTar unpacks a tar stream of model files into destDir, flattening
+// the archive's top-level directory and skipping everything ksound does not
+// need. All four required files must be present.
+func extractTar(r io.Reader, destDir string) error {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return err
+	}
+	tr := tar.NewReader(r)
+	extracted := map[string]bool{}
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -329,7 +586,13 @@ func downloadAndExtract(url, destDir string) error {
 		if err := f.Close(); err != nil {
 			return err
 		}
-		fmt.Printf("  extracted %s\n", name)
+		extracted[name] = true
+		infof("  extracted %s", name)
+	}
+	for _, want := range []string{"encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"} {
+		if !extracted[want] {
+			return fmt.Errorf("extract model: missing %s in archive", want)
+		}
 	}
 	return nil
 }
@@ -353,15 +616,18 @@ func downloadFile(url, dest string) error {
 	if err != nil {
 		return err
 	}
-	var body io.Reader = resp.Body
-	if resp.ContentLength > 0 {
-		body = &progressReader{r: resp.Body, total: resp.ContentLength}
-	}
-	if _, err := io.Copy(f, body); err != nil {
+	pr := &progressReader{r: resp.Body, total: resp.ContentLength}
+	if _, err := io.Copy(f, pr); err != nil {
 		if closeErr := f.Close(); closeErr != nil {
 			return fmt.Errorf("download: %w", errors.Join(err, closeErr))
 		}
 		return fmt.Errorf("download: %w", err)
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if pr.total > 0 && pr.read < pr.total {
+		return fmt.Errorf("download: truncated (%d of %d bytes)", pr.read, pr.total)
+	}
+	return nil
 }

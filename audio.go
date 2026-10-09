@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +23,20 @@ import (
 )
 
 const targetSampleRate = 16000
+
+// maxRecordingBytes caps in-memory capture (~6h at 16kHz s16 mono). Longer
+// sessions should use --duration chunks: the periodic .partial.pcm file
+// already provides crash safety, but the final samples slice still needs RAM.
+const maxRecordingBytes = 700 * 1024 * 1024
+
+// Capture stall detection: no new samples for captureStallAfter aborts the
+// recording, or captureStopGrace after the device layer reports a stop
+// (malgo fires its Stop callback on unplug/hot-plug).
+const (
+	captureStallAfter = 10 * time.Second
+	captureStopGrace  = 2 * time.Second
+	captureCheckEvery = time.Second
+)
 
 func timestampNow() string { return time.Now().Format("2006-01-02_15-04-05") }
 
@@ -42,21 +58,22 @@ func NormalizeAudioFormat(f string) (string, error) {
 	}
 }
 
-// DefaultAudioFile returns recordings/<timestamp>.<ext> for the given format,
-// creating the recordings dir.
+// DefaultAudioFile returns recordings/<timestamp>.<ext> for the given format.
+// It is pure: creating the directory is the caller's job (see EnsureAudioPath).
 func DefaultAudioFile(format string) (string, error) {
-	if err := os.MkdirAll("recordings", 0o755); err != nil {
+	f, err := NormalizeAudioFormat(format)
+	if err != nil {
 		return "", err
 	}
-	return filepath.Join("recordings", fmt.Sprintf("%s.%s", timestampNow(), format)), nil
+	return filepath.Join("recordings", fmt.Sprintf("%s.%s", timestampNow(), f)), nil
 }
 
-// EnsureAudioPath resolves the output path and effective audio format. An
-// explicit .flac/.wav extension wins over the default; if the user also passed
-// --format explicitly (formatSet) and it conflicts with the extension, that is
-// an error. Other extensions are rejected; a missing extension gets the
-// format's extension. Parent dirs are created.
-func EnsureAudioPath(out, format string, formatSet bool) (string, string, error) {
+// ResolveAudioPath resolves the output path and effective audio format without
+// touching the filesystem. An explicit .flac/.wav extension wins over the
+// default; if the user also passed --format explicitly (formatSet) and it
+// conflicts with the extension, that is an error. Other extensions are
+// rejected; a missing extension gets the format's extension.
+func ResolveAudioPath(out, format string, formatSet bool) (string, string, error) {
 	f, err := NormalizeAudioFormat(format)
 	if err != nil {
 		return "", "", err
@@ -72,18 +89,31 @@ func EnsureAudioPath(out, format string, formatSet bool) (string, string, error)
 		if formatSet && eff != f {
 			return "", "", fmt.Errorf("output extension %q conflicts with --format %s", ext, f)
 		}
-		if err := mkdirFor(out); err != nil {
-			return "", "", err
-		}
 		return out, eff, nil
 	case "":
-		if err := mkdirFor(out); err != nil {
-			return "", "", err
-		}
 		return out + "." + f, f, nil
 	default:
 		return "", "", fmt.Errorf("ksound records flac or wav only (got %q)", ext)
 	}
+}
+
+// EnsureAudioPath resolves the output path (see ResolveAudioPath) and creates
+// parent directories.
+func EnsureAudioPath(out, format string, formatSet bool) (string, string, error) {
+	p, f, err := ResolveAudioPath(out, format, formatSet)
+	if err != nil {
+		return "", "", err
+	}
+	if out == "" {
+		if err := os.MkdirAll("recordings", 0o755); err != nil {
+			return "", "", err
+		}
+		return p, f, nil
+	}
+	if err := mkdirFor(p); err != nil {
+		return "", "", err
+	}
+	return p, f, nil
 }
 
 // mkdirFor creates the parent directory of path when it is not the cwd.
@@ -93,6 +123,68 @@ func mkdirFor(path string) error {
 		return nil
 	}
 	return os.MkdirAll(dir, 0o755)
+}
+
+// recordingSpaceNeed estimates the disk bytes a recording of maxDur needs
+// until the file is saved: the .partial.pcm copy (exact PCM size) plus the
+// finished audio (full size for WAV, at most ~3/4 for FLAC), plus 1MB slack.
+func recordingSpaceNeed(maxDur time.Duration, format string) int64 {
+	pcm := int64(maxDur.Seconds() * targetSampleRate * 2)
+	if format == FormatWAV {
+		return 2*pcm + 1<<20
+	}
+	return pcm + pcm*3/4 + 1<<20
+}
+
+// evaluateRecordingSpace reports whether free bytes on the target volume can
+// hold a recording of maxDur (0 = until stopped). It returns an error when a
+// fixed-duration recording would certainly overflow, or a warning message
+// when an open-ended recording could exhaust the disk.
+func evaluateRecordingSpace(free int64, maxDur time.Duration, format string) (string, error) {
+	if maxDur > 0 {
+		need := recordingSpaceNeed(maxDur, format)
+		if free < need {
+			return "", fmt.Errorf("not enough disk space for a %s recording: need ~%s free, have %s",
+				maxDur, humanBytes(need), humanBytes(free))
+		}
+		return "", nil
+	}
+	if free < maxRecordingBytes {
+		return fmt.Sprintf("only %s free on the recording volume; a very long session can fill it (capture capped at %s)",
+			humanBytes(free), humanBytes(maxRecordingBytes)), nil
+	}
+	return "", nil
+}
+
+// checkRecordingSpace probes the volume holding path before recording starts
+// (see evaluateRecordingSpace). Platforms without a probe skip the check.
+func checkRecordingSpace(path string, maxDur time.Duration, format string) error {
+	free, err := freeDiskBytes(path)
+	if err != nil {
+		return nil
+	}
+	warnMsg, err := evaluateRecordingSpace(free, maxDur, format)
+	if err != nil {
+		return err
+	}
+	if warnMsg != "" {
+		warnf("%s", warnMsg)
+	}
+	return nil
+}
+
+// humanBytes renders n as a compact binary unit string ("6.2 GB").
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // InferAudioFormat returns flac/wav based on file extension.
@@ -136,8 +228,12 @@ const (
 	stopEnter stopReason = iota
 	stopSignal
 	stopDuration
-	stopPartialError
+	stopCaptureError
 )
+
+// errCaptureStalled reports that the capture device stopped delivering audio
+// for too long, typically because it was unplugged or claimed by another app.
+var errCaptureStalled = errors.New("capture device stopped responding (unplugged or in use by another application?)")
 
 // waitForStop blocks until one of the injected events fires and reports why.
 // A nil channel blocks forever, so callers can leave duration disabled by
@@ -147,7 +243,7 @@ func waitForStop(enter <-chan struct{}, sig <-chan os.Signal, timeout <-chan tim
 	return reason
 }
 
-func waitForStopWithErrors(enter <-chan struct{}, sig <-chan os.Signal, timeout <-chan time.Time, partialErr <-chan error) (stopReason, error) {
+func waitForStopWithErrors(enter <-chan struct{}, sig <-chan os.Signal, timeout <-chan time.Time, errs <-chan error) (stopReason, error) {
 	select {
 	case <-enter:
 		return stopEnter, nil
@@ -155,8 +251,44 @@ func waitForStopWithErrors(enter <-chan struct{}, sig <-chan os.Signal, timeout 
 		return stopSignal, nil
 	case <-timeout:
 		return stopDuration, nil
-	case err := <-partialErr:
-		return stopPartialError, err
+	case err := <-errs:
+		return stopCaptureError, err
+	}
+}
+
+// monitorCaptureStall reports errCaptureStalled on out when no new audio has
+// been captured for stallAfter, or for graceAfter after the device layer
+// reported that the device stopped. It exits when done closes. The send on
+// out is non-blocking: the first reported error wins.
+func monitorCaptureStall(mu *sync.Mutex, raw *[]byte, deviceStopped *atomic.Bool, stallAfter, graceAfter, checkEvery time.Duration, done <-chan struct{}, out chan<- error) {
+	ticker := time.NewTicker(checkEvery)
+	defer ticker.Stop()
+	lastLen := -1
+	lastChange := time.Now()
+	for {
+		select {
+		case <-done:
+			return
+		case now := <-ticker.C:
+			mu.Lock()
+			n := len(*raw)
+			mu.Unlock()
+			if n != lastLen {
+				lastLen, lastChange = n, now
+				continue
+			}
+			limit := stallAfter
+			if deviceStopped != nil && deviceStopped.Load() {
+				limit = graceAfter
+			}
+			if now.Sub(lastChange) >= limit {
+				select {
+				case out <- errCaptureStalled:
+				default:
+				}
+				return
+			}
+		}
 	}
 }
 
@@ -291,24 +423,30 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 		if err != nil {
 			return nil, fmt.Errorf("list devices: %w", err)
 		}
+		// selectedID is kept alive for the whole capture: DeviceID.Pointer()
+		// must not point at a loop-local copy.
+		var selectedID malgo.DeviceID
 		matched := false
-		for _, d := range infos {
-			if strings.Contains(strings.ToLower(d.Name()), strings.ToLower(deviceSubstr)) {
-				// Keep a copy alive for the duration of capture.
-				id := d.ID
-				deviceConfig.Capture.DeviceID = id.Pointer()
+		matchedName := ""
+		for i := range infos {
+			if strings.Contains(strings.ToLower(infos[i].Name()), strings.ToLower(deviceSubstr)) {
+				selectedID = infos[i].ID
+				matchedName = infos[i].Name()
 				matched = true
-				fmt.Printf("Using input device: %s\n", d.Name())
 				break
 			}
 		}
 		if !matched {
 			return nil, fmt.Errorf("no capture device matching %q", deviceSubstr)
 		}
+		deviceConfig.Capture.DeviceID = selectedID.Pointer()
+		infof("Using input device: %s", matchedName)
 	}
 
 	var mu sync.Mutex
 	raw := make([]byte, 0, targetSampleRate*2*30) // ~30s prealloc
+	overflow := false
+	var deviceStopped atomic.Bool
 
 	callbacks := malgo.DeviceCallbacks{
 		Data: func(_, pSample []byte, framecount uint32) {
@@ -316,9 +454,19 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 				return
 			}
 			mu.Lock()
-			raw = append(raw, pSample...)
+			if len(raw) >= maxRecordingBytes {
+				overflow = true
+			} else {
+				// Clamp the append so one over-long session cannot OOM.
+				if len(raw)+len(pSample) > maxRecordingBytes {
+					pSample = pSample[:maxRecordingBytes-len(raw)]
+					overflow = true
+				}
+				raw = append(raw, pSample...)
+			}
 			mu.Unlock()
 		},
+		Stop: func() { deviceStopped.Store(true) },
 	}
 
 	device, err := malgo.InitDevice(ctx.Context, deviceConfig, callbacks)
@@ -332,27 +480,43 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 	}
 	defer device.Stop()
 
+	// recordErrCh collects runtime capture failures (partial-file writes and
+	// device stalls) for the wait loop below; buffer 2 so both sources can
+	// report without blocking.
+	recordErrCh := make(chan error, 2)
+
 	var partialWG sync.WaitGroup
 	stopPartial := make(chan struct{})
-	var partialErrors <-chan error
 	if partialPath != "" {
-		errCh := make(chan error, 1)
-		partialErrors = errCh
 		partialWG.Add(1)
 		go func() {
 			defer partialWG.Done()
-			writePartialLoopWithErrors(&mu, &raw, partialPath, stopPartial, errCh)
+			writePartialLoopWithErrors(&mu, &raw, partialPath, stopPartial, recordErrCh)
 		}()
 	}
+
+	stopMonitor := make(chan struct{})
+	var monitorWG sync.WaitGroup
+	monitorWG.Add(1)
+	go func() {
+		defer monitorWG.Done()
+		monitorCaptureStall(&mu, &raw, &deviceStopped,
+			captureStallAfter, captureStopGrace, captureCheckEvery, stopMonitor, recordErrCh)
+	}()
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
 	enterCh := make(chan struct{}, 1)
-	go readEnter(enterCh)
-	if !stdinIsTerminal() {
-		fmt.Fprintln(os.Stderr, "stdin is not a terminal; press Ctrl+C or pass --duration to stop")
+	// Only watch stdin when it is a terminal. Otherwise the reader goroutine
+	// would block on ReadString forever (one leaked goroutine per run) and
+	// EOF must never stop a non-interactive recording.
+	interactive := stdinIsTerminal()
+	if interactive {
+		go readEnter(enterCh)
+	} else {
+		infof("stdin is not a terminal; press Ctrl+C or pass --duration to stop")
 	}
 
 	var timeoutCh <-chan time.Time
@@ -360,13 +524,13 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 		timer := time.NewTimer(maxDur)
 		defer timer.Stop()
 		timeoutCh = timer.C
-		fmt.Printf("Recording... press Enter or Ctrl+C to stop early (max %s).\n", maxDur)
+		infof("Recording... press Enter or Ctrl+C to stop early (max %s).", maxDur)
 	} else {
-		fmt.Println("Recording... press Enter to stop.")
+		infof("Recording... press Enter to stop.")
 	}
 
 	stopMeter := startLevelMeter(&mu, &raw, time.Now())
-	reason, partialErr := waitForStopWithErrors(enterCh, sigCh, timeoutCh, partialErrors)
+	reason, captureErr := waitForStopWithErrors(enterCh, sigCh, timeoutCh, recordErrCh)
 	stopMeter()
 
 	if reason == stopSignal {
@@ -375,11 +539,13 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 		fmt.Fprintln(os.Stderr, "\nInterrupted — saving recording...")
 	}
 
+	close(stopMonitor)
+	monitorWG.Wait()
 	close(stopPartial)
 	partialWG.Wait()
-	if partialErr == nil && partialErrors != nil {
+	if captureErr == nil {
 		select {
-		case partialErr = <-partialErrors:
+		case captureErr = <-recordErrCh:
 		default:
 		}
 	}
@@ -387,12 +553,15 @@ func RecordUntilStop(deviceSubstr string, maxDur time.Duration, partialPath stri
 	mu.Lock()
 	defer mu.Unlock()
 
+	if overflow {
+		warnf("recording hit %dMB cap; audio truncated, use --duration chunks for very long sessions", maxRecordingBytes>>20)
+	}
 	n := len(raw) / 2
 	samples := make([]int16, n)
 	for i := 0; i < n; i++ {
 		samples[i] = int16(binary.LittleEndian.Uint16(raw[i*2:]))
 	}
-	return samples, partialErr
+	return samples, captureErr
 }
 
 // RecoverPartialRecordings converts leftover *.partial.pcm crash files in dir
@@ -428,7 +597,7 @@ func RecoverPartialRecordings(dir string) ([]string, error) {
 			return recovered, err
 		}
 		recovered = append(recovered, out)
-		fmt.Printf("Recovered unsaved recording: %s\n", out)
+		infof("Recovered unsaved recording: %s", out)
 	}
 	return recovered, nil
 }
@@ -536,7 +705,8 @@ func startLevelMeter(mu *sync.Mutex, raw *[]byte, t0 time.Time) (stop func()) {
 	return func() { close(done); wg.Wait(); fmt.Println() }
 }
 
-// SaveWAV writes mono 16-bit samples to path.
+// SaveWAV writes mono 16-bit samples to path in chunks so hour-long
+// recordings do not need a second full-size []int copy.
 func SaveWAV(path string, samples []int16) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -547,22 +717,28 @@ func SaveWAV(path string, samples []int16) error {
 	enc := wav.NewEncoder(f, targetSampleRate, 16, 1, 1)
 	defer enc.Close()
 
-	data := make([]int, len(samples))
-	for i, s := range samples {
-		data[i] = int(s)
-	}
-	buf := &audio.IntBuffer{
-		Format:         &audio.Format{NumChannels: 1, SampleRate: targetSampleRate},
-		Data:           data,
-		SourceBitDepth: 16,
-	}
-	if err := enc.Write(buf); err != nil {
-		return fmt.Errorf("write wav: %w", err)
+	const chunk = 64 * 1024
+	format := &audio.Format{NumChannels: 1, SampleRate: targetSampleRate}
+	data := make([]int, 0, min(len(samples), chunk))
+	for start := 0; start < len(samples); start += chunk {
+		end := start + chunk
+		if end > len(samples) {
+			end = len(samples)
+		}
+		data = data[:0]
+		for _, s := range samples[start:end] {
+			data = append(data, int(s))
+		}
+		buf := &audio.IntBuffer{Format: format, Data: data, SourceBitDepth: 16}
+		if err := enc.Write(buf); err != nil {
+			return fmt.Errorf("write wav: %w", err)
+		}
 	}
 	return enc.Close()
 }
 
-// SaveFLAC writes mono 16-bit samples as FLAC (level 5).
+// SaveFLAC writes mono 16-bit samples as FLAC (level 5) in chunks so
+// hour-long recordings do not need a second full-size []byte copy.
 func SaveFLAC(path string, samples []int16) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -579,13 +755,21 @@ func SaveFLAC(path string, samples []int16) error {
 		f.Close()
 		return fmt.Errorf("init flac encoder: %w", err)
 	}
-	raw := make([]byte, len(samples)*2)
-	for i, s := range samples {
-		binary.LittleEndian.PutUint16(raw[i*2:], uint16(s))
-	}
-	if _, err := enc.Write(raw); err != nil {
-		f.Close()
-		return fmt.Errorf("write flac: %w", err)
+	const chunk = 64 * 1024
+	raw := make([]byte, 0, min(len(samples), chunk)*2)
+	for start := 0; start < len(samples); start += chunk {
+		end := start + chunk
+		if end > len(samples) {
+			end = len(samples)
+		}
+		raw = raw[:0]
+		for _, s := range samples[start:end] {
+			raw = append(raw, byte(s), byte(uint16(s)>>8))
+		}
+		if _, err := enc.Write(raw); err != nil {
+			f.Close()
+			return fmt.Errorf("write flac: %w", err)
+		}
 	}
 	if err := enc.Close(); err != nil {
 		f.Close()
@@ -634,6 +818,8 @@ func Int16ToFloat32(samples []int16) []float32 {
 
 // DecodeFLACFile reads a FLAC file, mixes to mono float32, and returns the
 // stream sample rate. Non-16-bit depths are scaled accordingly.
+// Note: the whole stream is held in memory; hour-long files need ~700MB.
+// Chunked streaming decode would be the next step if that matters.
 func DecodeFLACFile(path string) ([]float32, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -747,9 +933,11 @@ func DecodeWAVFile(path string) ([]float32, int, error) {
 }
 
 // ResampleLinear resamples mono float32 audio by linear interpolation.
-// Returns src unchanged when rates match.
+// Returns src unchanged when rates match or are invalid. Linear interpolation
+// is adequate for VAD scouting; the recognizer always receives the original
+// rate (see transcribeLong) so ASR quality is unaffected.
 func ResampleLinear(src []float32, fromRate, toRate int) []float32 {
-	if fromRate == toRate || len(src) == 0 {
+	if fromRate <= 0 || toRate <= 0 || fromRate == toRate || len(src) == 0 {
 		return src
 	}
 	n := int(int64(len(src)) * int64(toRate) / int64(fromRate))

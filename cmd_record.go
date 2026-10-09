@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -9,11 +10,14 @@ import (
 )
 
 func recordToFile(audioOut, device, format string, formatSet bool, gain float64, maxDur time.Duration) (string, error) {
-	if gain <= 0 || gain > 20 {
-		return "", fmt.Errorf("invalid --gain %v (want 0 < gain <= 20)", gain)
+	if err := validateGain(gain); err != nil {
+		return "", err
 	}
 	out, effFormat, err := EnsureAudioPath(audioOut, format, formatSet)
 	if err != nil {
+		return "", err
+	}
+	if err := checkRecordingSpace(out, maxDur, effFormat); err != nil {
 		return "", err
 	}
 	partial := out + ".partial.pcm"
@@ -24,21 +28,25 @@ func recordToFile(audioOut, device, format string, formatSet bool, gain float64,
 		}
 		return "", fmt.Errorf("no audio captured")
 	}
+	dur := float64(len(samples)) / float64(targetSampleRate)
 	if recordErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: periodic recovery write failed: %v; saving captured audio normally\n", recordErr)
+		if errors.Is(recordErr, errCaptureStalled) {
+			warnf("%v; saving the %.1fs captured before the failure", recordErr, dur)
+		} else {
+			warnf("periodic recovery write failed: %v; saving captured audio normally", recordErr)
+		}
 	}
 	if clipped := ApplyGain(samples, gain); clipped > 0 {
 		pct := 100 * float64(clipped) / float64(len(samples))
-		fmt.Printf("Warning: %.1f%% of samples clipped at gain %.2f — lower --gain\n", pct, gain)
+		warnf("%.1f%% of samples clipped at gain %.2f — lower --gain", pct, gain)
 	}
 	if err := SaveAudio(out, effFormat, samples); err != nil {
 		return "", err
 	}
 	if err := os.Remove(partial); err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "warning: could not remove partial recording %s: %v\n", partial, err)
+		warnf("could not remove partial recording %s: %v", partial, err)
 	}
-	dur := float64(len(samples)) / float64(targetSampleRate)
-	fmt.Printf("Saved %s (%.1fs, %d samples)\n", out, dur, len(samples))
+	infof("Saved %s (%.1fs, %d samples)", out, dur, len(samples))
 	return out, nil
 }
 
@@ -46,7 +54,7 @@ func recordToFile(audioOut, device, format string, formatSet bool, gain float64,
 // FLAC so an interrupted recording is never lost.
 func recoverLeftovers() {
 	if _, err := RecoverPartialRecordings("recordings"); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not recover partial recordings: %v\n", err)
+		warnf("could not recover partial recordings: %v", err)
 	}
 }
 
@@ -61,12 +69,16 @@ func newRecordCmd() *cobra.Command {
 		Use:   "record",
 		Short: "Record from microphone until Enter, save as FLAC (default) or WAV",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate flags before touching the filesystem.
+			if err := validateGain(gain); err != nil {
+				return err
+			}
 			recoverLeftovers()
 			out, err := recordToFile(output, device, format, cmd.Flags().Changed("format"), gain, duration)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Next: ksound transcribe %s\n", out)
+			infof("Next: ksound transcribe %s", out)
 			return nil
 		},
 	}

@@ -1,39 +1,59 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"runtime"
 )
 
-func copyToClipboard(text string) error {
-	var commands [][]string
-	switch runtime.GOOS {
-	case "darwin":
-		commands = [][]string{{"pbcopy"}}
-	case "windows":
-		commands = [][]string{{"clip"}}
-	case "linux":
-		commands = [][]string{{"wl-copy"}, {"xclip", "-selection", "clipboard"}, {"xsel", "--clipboard", "--input"}}
-	default:
-		return fmt.Errorf("clipboard copying is not supported on %s", runtime.GOOS)
-	}
+// Indirections so tests can substitute fake clipboard utilities.
+var (
+	execLookPath = exec.LookPath
+	execCommand  = exec.Command
+)
 
-	var lastErr error
+// clipboardCommands returns the clipboard utilities to try for goos, in
+// preference order.
+func clipboardCommands(goos string) ([][]string, error) {
+	switch goos {
+	case "darwin":
+		return [][]string{{"pbcopy"}}, nil
+	case "windows":
+		return [][]string{{"clip"}}, nil
+	case "linux":
+		return [][]string{{"wl-copy"}, {"xclip", "-selection", "clipboard"}, {"xsel", "--clipboard", "--input"}}, nil
+	default:
+		return nil, fmt.Errorf("clipboard copying is not supported on %s", goos)
+	}
+}
+
+func copyToClipboard(text string) error {
+	commands, err := clipboardCommands(runtime.GOOS)
+	if err != nil {
+		return err
+	}
+	return copyViaCommands(commands, text)
+}
+
+// copyViaCommands pipes text into the first available utility, falling back
+// to the next one when a utility is missing or fails.
+func copyViaCommands(commands [][]string, text string) error {
+	var missingErr, waitErr error
 	for _, args := range commands {
-		path, err := exec.LookPath(args[0])
+		path, err := execLookPath(args[0])
 		if err != nil {
-			lastErr = err
+			missingErr = err
 			continue
 		}
-		cmd := exec.Command(path, args[1:]...)
+		cmd := execCommand(path, args[1:]...)
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return err
 		}
 		if err := cmd.Start(); err != nil {
-			lastErr = err
+			missingErr = err
 			continue
 		}
 		_, writeErr := io.WriteString(stdin, text)
@@ -44,7 +64,19 @@ func copyToClipboard(text string) error {
 		if closeErr != nil {
 			return closeErr
 		}
-		return cmd.Wait()
+		// Fall through to the next utility when this one fails at runtime
+		// (e.g. xclip installed but no X display available).
+		if err := cmd.Wait(); err != nil {
+			waitErr = err
+			continue
+		}
+		return nil
 	}
-	return fmt.Errorf("no clipboard utility found: %w", lastErr)
+	if waitErr != nil {
+		return fmt.Errorf("clipboard copy failed: %w", waitErr)
+	}
+	if missingErr != nil {
+		return fmt.Errorf("no clipboard utility found: %w", missingErr)
+	}
+	return errors.New("no clipboard utility available")
 }

@@ -1,0 +1,70 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"; exit 1
+          fi
+      - run: go vet ./...
+      - name: golangci-lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 run
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Install ALSA headers (Linux cgo)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Set up MinGW (Windows cgo)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+      - name: go test (unix)
+        if: runner.os != 'Windows'
+        run: go test ./...
+      - name: go test (windows, msys2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: go test ./...
+      - name: go test -race (linux)
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+      - name: Coverage gate
+        if: runner.os == 'Linux'
+        run: |
+          go test -coverprofile=cover.out ./...
+          cov=$(go tool cover -func=cover.out | tail -1 | awk '{gsub("%","",$NF); print $NF}')
+          echo "coverage: ${cov}%"
+          awk -v c="$cov" 'BEGIN { if (c < 48.0) { print "coverage below 48% gate"; exit 1 } }'
+      - name: go build (unix)
+        if: runner.os != 'Windows'
+        run: go build ./...
+      - name: go build (windows, msys2)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: go build ./...

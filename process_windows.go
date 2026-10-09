@@ -4,14 +4,8 @@ package main
 
 import (
 	"errors"
-	"os"
 	"syscall"
 )
-
-func isTerminal(file *os.File) bool {
-	var mode uint32
-	return syscall.GetConsoleMode(syscall.Handle(file.Fd()), &mode) == nil
-}
 
 const (
 	processQueryLimitedInformation = 0x1000
@@ -19,7 +13,11 @@ const (
 	windowsProcessStillActive      = 259
 )
 
+// processIsRunning reports whether pid belongs to a live process on Windows.
 func processIsRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
 	handle, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
 		return !errors.Is(err, windowsErrorInvalidParameter)

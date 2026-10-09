@@ -1,0 +1,145 @@
+name: release
+
+# Builds redistributable binaries on native runners (cgo: malgo + sherpa-onnx
+# link against shared libraries that must be bundled and rpath-rewritten) and
+# publishes a GitHub Release with checksums for every tag matching v*.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev patchelf
+      - name: Build and bundle
+        run: |
+          set -euo pipefail
+          OUT=dist/ksound_linux_amd64
+          mkdir -p "$OUT/lib"
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUT/ksound" .
+          VER=$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-linux)
+          LIB="$(go env GOMODCACHE)/github.com/k2-fsa/sherpa-onnx-go-linux@${VER}/lib/x86_64-unknown-linux-gnu"
+          cp "$LIB"/*.so "$OUT/lib/"
+          # Binary resolves its direct deps via $ORIGIN/lib; each bundled .so
+          # resolves its own deps (libsherpa -> libonnxruntime) via $ORIGIN.
+          patchelf --set-rpath '$ORIGIN/lib' "$OUT/ksound"
+          for so in "$OUT"/lib/*.so; do
+            patchelf --set-rpath '$ORIGIN' "$so"
+          done
+          "$OUT/ksound" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksound_linux_amd64
+          path: dist/ksound_linux_amd64
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Build and bundle both architectures
+        run: |
+          set -euo pipefail
+          MOD="$(go env GOMODCACHE)/github.com/k2-fsa/sherpa-onnx-go-macos@$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-macos)"
+          for ARCH in arm64 amd64; do
+            case "$ARCH" in
+              arm64) SLICE=aarch64-apple-darwin ;;
+              amd64) SLICE=x86_64-apple-darwin ;;
+            esac
+            OUT=dist/ksound_darwin_$ARCH
+            mkdir -p "$OUT/lib"
+            GOARCH=$ARCH go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUT/ksound" .
+            OLD=$(otool -l "$OUT/ksound" | awk '/cmd LC_RPATH/{f=1} f && $1=="path"{print $2; f=0}')
+            install_name_tool -delete_rpath "$OLD" "$OUT/ksound"
+            install_name_tool -add_rpath '@executable_path/lib' "$OUT/ksound"
+            cp "$MOD/lib/$SLICE/libsherpa-onnx-c-api.dylib" "$MOD/lib/$SLICE/libonnxruntime.dylib" "$OUT/lib/"
+            # Smoke test only the host architecture (cross-arch needs Rosetta).
+            if [ "$(uname -m)" = "$ARCH" ]; then
+              "$OUT/ksound" --version
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksound_darwin_arm64
+          path: dist/ksound_darwin_arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksound_darwin_amd64
+          path: dist/ksound_darwin_amd64
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+          cache: true
+      - name: Set up MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+      - name: Build and bundle
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          OUT=dist/ksound_windows_amd64
+          mkdir -p "$OUT"
+          go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUT/ksound.exe" .
+          VER=$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-windows)
+          MODCACHE=$(cygpath -u "$(go env GOMODCACHE)")
+          LIB="$MODCACHE/github.com/k2-fsa/sherpa-onnx-go-windows@${VER}/lib/x86_64-pc-windows-gnu"
+          # Windows resolves DLLs next to the executable.
+          cp "$LIB"/*.dll "$OUT/"
+          for dll in libgcc_s_seh-1.dll libwinpthread-1.dll; do
+            p=$(gcc -print-file-name="$dll")
+            if [ -f "$p" ]; then cp "$p" "$OUT/"; fi
+          done
+          "$OUT/ksound.exe" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ksound_windows_amd64
+          path: dist/ksound_windows_amd64
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          for d in */; do
+            d=${d%/}
+            case "$d" in
+              *windows*) (cd "$d" && zip -qr "../$d.zip" .) ;;
+              *) tar -czf "$d.tar.gz" "$d" ;;
+            esac
+          done
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --generate-notes --title "$GITHUB_REF_NAME"

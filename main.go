@@ -7,9 +7,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is set via -ldflags "-X main.version=..." at release time.
+var version = "dev"
+
 var rootCmd = &cobra.Command{
-	Use:   "ksound",
-	Short: "Record audio and transcribe it locally (Parakeet via sherpa-onnx)",
+	Use:     "ksound",
+	Version: version,
+	Short:   "Record audio and transcribe it locally (Parakeet via sherpa-onnx)",
 	Long: `ksound records from the default microphone and transcribes offline
 using NVIDIA Parakeet TDT 0.6b v2 (int8) via sherpa-onnx. English, plain text.
 Runs on macOS, Linux and Windows (mic permission required on first run).

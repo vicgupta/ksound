@@ -30,6 +30,8 @@ jobs:
           VER=$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-linux)
           LIB="$(go env GOMODCACHE)/github.com/k2-fsa/sherpa-onnx-go-linux@${VER}/lib/x86_64-unknown-linux-gnu"
           cp "$LIB"/*.so "$OUT/lib/"
+          # The module cache is read-only; patchelf needs the copies writable.
+          chmod u+w "$OUT"/lib/*.so
           # Binary resolves its direct deps via $ORIGIN/lib; each bundled .so
           # resolves its own deps (libsherpa -> libonnxruntime) via $ORIGIN.
           patchelf --set-rpath '$ORIGIN/lib' "$OUT/ksound"
@@ -61,7 +63,9 @@ jobs:
             esac
             OUT=dist/ksound_darwin_$ARCH
             mkdir -p "$OUT/lib"
-            GOARCH=$ARCH go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUT/ksound" .
+            # CGO must be explicit: cross-arch builds default to CGO_ENABLED=0,
+            # which would exclude the sherpa-onnx cgo package entirely.
+            CGO_ENABLED=1 GOARCH=$ARCH go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUT/ksound" .
             OLD=$(otool -l "$OUT/ksound" | awk '/cmd LC_RPATH/{f=1} f && $1=="path"{print $2; f=0}')
             install_name_tool -delete_rpath "$OLD" "$OUT/ksound"
             install_name_tool -add_rpath '@executable_path/lib' "$OUT/ksound"
@@ -94,6 +98,7 @@ jobs:
           msystem: MINGW64
           update: true
           install: mingw-w64-x86_64-gcc
+          path-type: inherit # make setup-go's go.exe visible in the shell
       - name: Build and bundle
         shell: msys2 {0}
         run: |

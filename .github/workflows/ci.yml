@@ -44,6 +44,7 @@ jobs:
           msystem: MINGW64
           update: true
           install: mingw-w64-x86_64-gcc
+          path-type: inherit # make setup-go's go.exe visible in the shell
       - name: go test (unix)
         if: runner.os != 'Windows'
         run: go test ./...

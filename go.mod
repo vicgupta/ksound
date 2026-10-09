@@ -9,7 +9,7 @@ require (
 	github.com/k2-fsa/sherpa-onnx-go v1.13.8
 	github.com/spf13/cobra v1.10.2
 	github.com/tphakala/go-flac v1.1.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.46.0
 )
 

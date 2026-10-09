@@ -51,7 +51,14 @@ jobs:
       - name: go test (windows, msys2)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: go test ./...
+        run: |
+          set -euo pipefail
+          # The test binary links the sherpa-onnx DLLs; they live in the
+          # module cache, so put them on PATH for the test run.
+          VER=$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-windows)
+          DLLDIR="$(cygpath -u "$(go env GOMODCACHE)")/github.com/k2-fsa/sherpa-onnx-go-windows@${VER}/lib/x86_64-pc-windows-gnu"
+          export PATH="$PATH:$DLLDIR"
+          go test ./...
       - name: go test -race (linux)
         if: runner.os == 'Linux'
         run: go test -race ./...

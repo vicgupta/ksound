@@ -20,9 +20,9 @@ import (
 const (
 	modelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2"
 	modelDir = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
-	// Silero VAD (~2MB) used to split long recordings into speech
-	// segments, since the Parakeet encoder cannot decode very long
-	// audio in one shot.
+	// Silero VAD (~0.6MB; upstream shrank it from ~2MB) used to split
+	// long recordings into speech segments, since the Parakeet encoder
+	// cannot decode very long audio in one shot.
 	vadModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 
 	// completeMarker is written last, once every model file is present and
@@ -38,7 +38,7 @@ const (
 	minDecoderBytes = int64(1 * 1024 * 1024)
 	minJoinerBytes  = int64(1 * 1024 * 1024)
 	minTokensBytes  = int64(1 * 1024)
-	minVadBytes     = int64(1 * 1024 * 1024)
+	minVadBytes     = int64(100 * 1024)
 
 	// staleTempDirMaxAge bounds PID-reuse risk: a tmp dir older than this is
 	// removed even if its PID appears live.

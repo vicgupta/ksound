@@ -164,6 +164,31 @@ func TestEnsureVadModelTruncatedLeavesNoFile(t *testing.T) {
 	assertNoVadFiles(t, dir)
 }
 
+// TestEnsureVadModelAcceptsSmallCompleteModel locks in the fix for upstream
+// shrinking silero_vad.onnx (~2MB -> ~0.6MB): a small but complete download
+// with matching Content-Length must be accepted, not rejected as truncated.
+func TestEnsureVadModelAcceptsSmallCompleteModel(t *testing.T) {
+	body := make([]byte, 600*1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path, err := ensureVadModel(dir, srv.URL)
+	if err != nil {
+		t.Fatalf("small complete model must be accepted: %v", err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != int64(len(body)) {
+		t.Fatalf("size = %d, want %d", st.Size(), len(body))
+	}
+}
+
 func assertNoVadFiles(t *testing.T, dir string) {
 	t.Helper()
 	for _, name := range []string{"silero_vad.onnx", "silero_vad.onnx.tmp"} {

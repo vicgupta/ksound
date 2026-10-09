@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-09
+
+### Fixed
+- Fix long (>300s) transcription failing with "VAD model download incomplete": upstream shrank `silero_vad.onnx` (~2MB to ~0.6MB), so lower the minimum-size gate to 100KB. Verified end-to-end (460s meeting audio, 22 VAD segments, RTF 0.03).
+
 ## [0.2.0] - 2026-10-08
 
 ### Added

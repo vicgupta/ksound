@@ -127,7 +127,7 @@ jobs:
     steps:
       # gh release create --generate-notes needs the git history.
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
       - name: Package and checksum

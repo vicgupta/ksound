@@ -347,9 +347,17 @@ func ensureVadModel(dir, url string) (string, error) {
 		return "", err
 	}
 	st, err := os.Stat(tmp)
-	if err != nil || st.IsDir() || st.Size() <= minVadBytes {
+	if err != nil {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("VAD model download incomplete in %s", dir)
+		return "", fmt.Errorf("VAD model download incomplete in %s: %w", dir, err)
+	}
+	if st.IsDir() || st.Size() <= minVadBytes {
+		_ = os.Remove(tmp)
+		// Include the gate value: a binary built from older source rejects
+		// today's smaller upstream model, and the raw numbers make that
+		// visible instead of looking like a network failure.
+		return "", fmt.Errorf("VAD model download too small in %s: got %d bytes, need > %d",
+			dir, st.Size(), minVadBytes)
 	}
 	if want := strings.TrimSpace(os.Getenv("KSOUND_VAD_SHA256")); want != "" {
 		if err := verifyFileSHA256(tmp, want); err != nil {

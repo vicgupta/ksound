@@ -3,7 +3,7 @@ module ksound
 go 1.27.1
 
 require (
-	github.com/gen2brain/malgo v0.11.26
+	github.com/gen2brain/malgo v0.11.27
 	github.com/go-audio/audio v1.0.0
 	github.com/go-audio/wav v1.1.0
 	github.com/k2-fsa/sherpa-onnx-go v1.13.8
